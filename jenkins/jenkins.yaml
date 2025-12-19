@@ -1,0 +1,115 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins
+  namespace: alphacar-cicd-ns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jenkins-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: jenkins
+  namespace: alphacar-cicd-ns
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jenkins-pvc
+  namespace: alphacar-cicd-ns
+spec:
+  storageClassName: nfs-client  # 우리가 만든 스토리지 클래스
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jenkins
+  namespace: alphacar-cicd-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jenkins
+  template:
+    metadata:
+      labels:
+        app: jenkins
+    spec:
+      serviceAccountName: jenkins
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 0  # 도커 명령어를 위해 잠시 루트 권한 사용 (실무에선 보안 주의)
+      containers:
+      - name: jenkins
+        image: jenkins/jenkins:lts
+        ports:
+        - containerPort: 8080
+        - containerPort: 50000
+        readinessProbe:
+          httpGet:
+            path: /login
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /login
+            port: 8080
+          initialDelaySeconds: 120
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        command:
+        - /bin/sh
+        - -c
+        - |
+          # Docker CLI 설치
+          apt-get update && apt-get install -y docker.io && rm -rf /var/lib/apt/lists/*
+          # Docker daemon 설정: Harbor를 insecure registry로 추가
+          mkdir -p /etc/docker
+          cat > /etc/docker/daemon.json <<EOF
+          {
+            "insecure-registries": ["192.168.56.200:30002", "http://192.168.56.200:30002"]
+          }
+          EOF
+          # Jenkins 시작
+          /usr/local/bin/jenkins.sh
+        volumeMounts:
+        - name: jenkins-data
+          mountPath: /var/jenkins_home
+        # 도커 소켓 마운트 (호스트의 도커를 빌려 쓰기 위함)
+        - name: docker-socket
+          mountPath: /var/run/docker.sock
+      volumes:
+      - name: jenkins-data
+        persistentVolumeClaim:
+          claimName: jenkins-pvc
+      - name: docker-socket
+        hostPath:
+          path: /var/run/docker.sock
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins-service
+  namespace: alphacar-cicd-ns
+spec:
+  type: NodePort
+  selector:
+    app: jenkins
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 32000  # 외부 접속 포트

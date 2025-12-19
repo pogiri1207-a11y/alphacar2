@@ -1,0 +1,26 @@
+# ArgoCD ConfigMap 수정 - 프록시 설정 제거 또는 수정
+# 이 파일을 적용하기 전에 현재 설정을 확인하세요:
+# kubectl get configmap -n argocd argocd-cm -o yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-cmd-argocd-cm
+    app.kubernetes.io/part-of: argocd
+data:
+  # 프록시 설정이 있다면 주석 처리하거나 제거
+  # url: ""
+  # noProxy: ""
+  
+  # GitHub 직접 연결 허용
+  # repository.credentials: |
+  #   - url: https://github.com
+  #     passwordSecret:
+  #       name: github-secret
+  #       key: password
+  #     usernameSecret:
+  #       name: github-secret
+  #       key: username

@@ -1,0 +1,298 @@
+pipeline {
+    agent any
+
+    parameters {
+        // 빌드할 서비스를 선택 (전체 빌드도 가능하게 'all' 추가)
+        choice(name: 'SERVICE_NAME', 
+               choices: ['all', 'main', 'aichat', 'news', 'mypage', 'community', 'search', 'quote'], 
+               description: '빌드할 백엔드 서비스를 선택하세요')
+        string(name: 'VERSION', defaultValue: '1.0', description: '기본 버전 (뒤에 빌드 번호가 자동으로 붙습니다)')
+    }
+
+    environment {
+        HARBOR_URL = 'http://192.168.56.200:30002'
+        HARBOR_PROJECT = 'alphacar'
+        CREDENTIAL_ID = 'harbor-cred' // 젠킨스에 등록한 Harbor ID/PW
+        SONARQUBE = 'sonarqube'
+        SONAR_URL = 'http://192.168.56.200:32001'
+        SONAR_TOKEN_ID = 'sonarqube-token' // SonarQube 토큰 (없으면 빈 문자열로 설정)
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                script {
+                    // 버전 번호 생성 (예: 1.0.25)
+                    env.FULL_VERSION = "${params.VERSION}.${currentBuild.number}"
+                    
+                    // 빌드할 서비스 목록 결정
+                    if (params.SERVICE_NAME == 'all') {
+                        env.SERVICES = 'main,aichat,news,mypage,community,search,quote'
+                    } else {
+                        env.SERVICES = params.SERVICE_NAME
+                    }
+                    echo "🚀 Target Services: ${env.SERVICES} / Version: ${env.FULL_VERSION}"
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    // SonarQube 연결 확인 및 선택적 실행
+                    def sonarAvailable = false
+                    try {
+                        def response = sh(
+                            script: "curl -s -m 5 ${SONAR_URL}/api/system/status || echo 'FAILED'",
+                            returnStdout: true
+                        ).trim()
+                        if (response.contains('"status"') || response.contains('UP')) {
+                            sonarAvailable = true
+                            echo "✅ SonarQube 서버 연결 확인됨"
+                        }
+                    } catch (Exception e) {
+                        echo "⚠️ SonarQube 서버 연결 실패: ${e.getMessage()}"
+                    }
+                    
+                    if (sonarAvailable) {
+                        def scannerHome = tool 'sonar-scanner'
+                        
+                        // SonarQube 인증 토큰 사용 (오류 무시하고 계속 진행)
+                        try {
+                            withSonarQubeEnv("${SONARQUBE}") {
+                                def output = sh(
+                                    script: """
+                                        ${scannerHome}/bin/sonar-scanner \\
+                                            -Dsonar.projectKey=alphacar-backend \\
+                                            -Dsonar.projectName=alphacar-backend \\
+                                            -Dsonar.sources=backend \\
+                                            -Dsonar.host.url=${SONAR_URL} \\
+                                            -Dsonar.sourceEncoding=UTF-8 \\
+                                            -Dsonar.scanner.timeout=300 2>&1
+                                    """,
+                                    returnStdout: true
+                                )
+                                if (output.contains("ANALYSIS SUCCESSFUL")) {
+                                    echo "✅ SonarQube 분석 완료"
+                                } else {
+                                    echo "⚠️ SonarQube 분석 완료 (일부 경고 발생, 계속 진행)"
+                                }
+                            }
+                        } catch (Exception e) {
+                            // withSonarQubeEnv 실패 시 토큰 직접 사용 시도
+                            echo "⚠️ withSonarQubeEnv 실패, 토큰 직접 사용 시도..."
+                            try {
+                                withCredentials([string(credentialsId: "${SONAR_TOKEN_ID}", variable: 'SONAR_TOKEN')]) {
+                                    def output = sh(
+                                        script: """
+                                            ${scannerHome}/bin/sonar-scanner \\
+                                                -Dsonar.projectKey=alphacar-backend \\
+                                                -Dsonar.projectName=alphacar-backend \\
+                                                -Dsonar.sources=backend \\
+                                                -Dsonar.host.url=${SONAR_URL} \\
+                                                -Dsonar.token=\${SONAR_TOKEN} \\
+                                                -Dsonar.sourceEncoding=UTF-8 \\
+                                                -Dsonar.scanner.timeout=300 2>&1
+                                        """,
+                                        returnStdout: true
+                                    )
+                                    if (output.contains("ANALYSIS SUCCESSFUL")) {
+                                        echo "✅ SonarQube 분석 완료 (토큰 사용)"
+                                    } else {
+                                        echo "⚠️ SonarQube 분석 완료 (일부 경고 발생, 계속 진행)"
+                                    }
+                                }
+                            } catch (Exception e2) {
+                                echo "⚠️ SonarQube 분석 실패, 계속 진행: ${e2.getMessage()}"
+                            }
+                        }
+                    } else {
+                        echo "⚠️ SonarQube 서버를 사용할 수 없습니다. 분석을 건너뜁니다."
+                    }
+                    echo "✅ SonarQube 단계 완료 - Trivy로 진행"
+                }
+            }
+        }
+
+        stage('Trivy Security Scan') {
+            steps {
+                script {
+                    // Trivy DB 업데이트
+                    echo "🔄 Updating Trivy DB..."
+                    sh "docker run --rm -v trivy_cache:/root/.cache aquasec/trivy:latest image --download-db-only || true"
+                    
+                    def serviceList = env.SERVICES.split(',')
+                    def TRIVY_OPTIONS = "--exit-code 0 --severity HIGH,CRITICAL --timeout 5m --no-progress --skip-db-update --skip-files 'root/.npm/_cacache/*' --cache-dir /root/.cache/trivy"
+                    
+                    // 소스 코드 스캔 (빌드 전)
+                    def scanSteps = [:]
+                    serviceList.each { service ->
+                        scanSteps["Scan-${service}"] = {
+                            echo "🛡️ Scanning [${service}] source code..."
+                            sh """
+                                docker run --rm \\
+                                    -v \$(pwd):/workspace \\
+                                    -v trivy_cache:/root/.cache \\
+                                    -w /workspace \\
+                                    aquasec/trivy:latest fs ${TRIVY_OPTIONS} \\
+                                    backend/${service}/ 2>&1 || true
+                            """
+                        }
+                    }
+                    
+                    // 병렬 스캔 실행
+                    parallel scanSteps
+                    echo "✅ Trivy 보안 스캔 완료 - 빌드로 진행"
+                }
+            }
+        }
+
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                        withCredentials([usernamePassword(credentialsId: "${CREDENTIAL_ID}", usernameVariable: 'HUB_USER', passwordVariable: 'HUB_PASS')]) {
+                        // Harbor 로그인 (HTTP 사용)
+                        // 주의: 호스트 노드의 Docker daemon이 insecure registry를 인식하려면 재시작 필요
+                        sh """
+                            # Harbor 로그인 (프로토콜 없이 시도 - Docker daemon이 insecure registry로 인식)
+                            echo "\${HUB_PASS}" | docker login 192.168.56.200:30002 -u \${HUB_USER} --password-stdin
+                        """
+
+                        def serviceList = env.SERVICES.split(',')
+                        
+                        // 병렬 빌드 (빠른 빌드)
+                        def buildSteps = [:]
+                        serviceList.each { service ->
+                            buildSteps["Build-${service}"] = {
+                                echo "📦 Building [${service}]..."
+                                def imageBase = "192.168.56.200:30002/${HARBOR_PROJECT}/${service}"
+                                timeout(time: 20, unit: 'MINUTES') {
+                                    sh """
+                                        # BuildKit 활성화 및 캐시 이미지 pull
+                                        export DOCKER_BUILDKIT=1
+                                        docker pull ${imageBase}:latest || true
+                                        
+                                        # 빌드 컨텍스트 확인
+                                        echo "📁 Build context: backend/"
+                                        echo "📄 Dockerfile: backend/${service}/Dockerfile"
+                                        
+                                        # BuildKit을 사용한 빠른 빌드 (상세 로그)
+                                        docker build \\
+                                            --build-arg APP_NAME=${service} \\
+                                            --cache-from ${imageBase}:latest \\
+                                            --progress=plain \\
+                                            --no-cache=false \\
+                                            -f backend/${service}/Dockerfile \\
+                                            -t ${imageBase}:${env.FULL_VERSION} \\
+                                            -t ${imageBase}:latest \\
+                                            backend/ 2>&1 | tee /tmp/build-${service}.log || {
+                                            echo "⚠️ Build failed, checking logs..."
+                                            tail -50 /tmp/build-${service}.log || true
+                                            echo "⚠️ Retrying without cache..."
+                                            docker build \\
+                                                --build-arg APP_NAME=${service} \\
+                                                --progress=plain \\
+                                                -f backend/${service}/Dockerfile \\
+                                                -t ${imageBase}:${env.FULL_VERSION} \\
+                                                -t ${imageBase}:latest \\
+                                                backend/
+                                        }
+                                        
+                                        # 빌드된 이미지 확인 및 검증
+                                        echo "🔍 Verifying built image..."
+                                        if docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${imageBase}:${env.FULL_VERSION}\$"; then
+                                            echo "✅ Image ${imageBase}:${env.FULL_VERSION} built successfully"
+                                            docker images | grep ${service} | head -3
+                                        else
+                                            echo "❌ Image ${imageBase}:${env.FULL_VERSION} not found after build!"
+                                            echo "📋 Available images:"
+                                            docker images | grep ${service} || echo "No images found"
+                                            exit 1
+                                        fi
+                                    """
+                                }
+                            }
+                        }
+                        
+                        // 병렬 빌드 실행
+                        parallel buildSteps
+                        echo "✅ All images built successfully"
+                        
+                        // 빌드 검증: 모든 이미지가 존재하는지 확인
+                        echo "🔍 Verifying all built images..."
+                        serviceList.each { service ->
+                            def imageBase = "192.168.56.200:30002/${HARBOR_PROJECT}/${service}"
+                            sh """
+                                if ! docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${imageBase}:${env.FULL_VERSION}\$"; then
+                                    echo "❌ ERROR: Image ${imageBase}:${env.FULL_VERSION} not found!"
+                                    exit 1
+                                fi
+                            """
+                        }
+                        echo "✅ All images verified"
+                        
+                        // 병렬 푸시 (타임아웃 설정)
+                        def pushSteps = [:]
+                        serviceList.each { service ->
+                            pushSteps["Push-${service}"] = {
+                                timeout(time: 10, unit: 'MINUTES') {
+                                    echo "📤 Pushing [${service}]..."
+                                    def imageBase = "192.168.56.200:30002/${HARBOR_PROJECT}/${service}"
+                                    
+                                    // 이미지 존재 여부 확인
+                                    sh """
+                                        echo "🔍 Checking if image exists..."
+                                        if docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${imageBase}:${env.FULL_VERSION}\$"; then
+                                            echo "✅ Image ${imageBase}:${env.FULL_VERSION} found"
+                                        else
+                                            echo "❌ Image ${imageBase}:${env.FULL_VERSION} not found!"
+                                            echo "📋 Available images:"
+                                            docker images | grep ${service} || echo "No images found for ${service}"
+                                            exit 1
+                                        fi
+                                    """
+                                    
+                                    retry(3) {
+                                        sh """
+                                            # 버전 태그 푸시
+                                            echo "📤 Pushing ${imageBase}:${env.FULL_VERSION}..."
+                                            docker push ${imageBase}:${env.FULL_VERSION} || {
+                                                echo "⚠️ Push failed, retrying..."
+                                                sleep 2
+                                                docker push ${imageBase}:${env.FULL_VERSION} || exit 1
+                                            }
+                                            
+                                            # latest 태그 푸시
+                                            echo "📤 Pushing ${imageBase}:latest..."
+                                            docker push ${imageBase}:latest || {
+                                                echo "⚠️ Push latest failed, retrying..."
+                                                sleep 2
+                                                docker push ${imageBase}:latest || exit 1
+                                            }
+                                            
+                                            echo "✅ Successfully pushed ${service} to Harbor"
+                                            
+                                            # 이미지 삭제 (선택적)
+                                            docker rmi ${imageBase}:${env.FULL_VERSION} || true
+                                        """
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // 병렬 푸시 실행
+                        parallel pushSteps
+                        echo "✅ All images pushed to Harbor"
+                        
+                        sh "docker logout 192.168.56.200:30002"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success { echo "✅ 백엔드 배포 준비 완료! 하버를 확인하세요." }
+        failure { echo "❌ 빌드 실패! 로그를 확인해 주세요." }
+    }
+}
